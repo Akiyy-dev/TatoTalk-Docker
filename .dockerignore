@@ -1,0 +1,14 @@
+.git
+.env
+.env.*
+__pycache__
+**/__pycache__
+*.pyc
+tests
+.venv
+.pytest_cache
+.ruff_cache
+*.apk
+data
+release
+.tools

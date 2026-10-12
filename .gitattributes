@@ -1,0 +1,9 @@
+* text=auto
+Dockerfile text eol=lf
+*.yaml text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+.env.example text eol=lf
+.gitignore text eol=lf
+.dockerignore text eol=lf
+*.sh text eol=lf
