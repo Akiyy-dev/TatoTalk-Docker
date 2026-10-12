@@ -31,10 +31,14 @@ trap cleanup EXIT
 cat > "$state_dir/validate.py" <<'PY'
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sys
+from urllib.parse import urlencode, urlsplit
 
+# Bash consumes these outputs on Linux and in Windows Git Bash.
+sys.stdout.reconfigure(newline="\n")
 state = Path(sys.argv[1])
 command = sys.argv[2]
 required = {"TatoTalk-Docker.zip", "image-manifest.json", "SHA256SUMS.txt"}
@@ -46,11 +50,33 @@ def fail(message):
 def managed(name):
     return isinstance(name, str) and (name in required or part_pattern.fullmatch(name))
 
+def read_json(filename):
+    return json.loads((state / filename).read_text(encoding="utf-8"))
+
+def write_text(filename, content):
+    (state / filename).write_text(content, encoding="utf-8", newline="\n")
+
 def pages(filename):
-    data = json.loads((state / filename).read_text(encoding="utf-8"))
+    data = read_json(filename)
     if not isinstance(data, list) or any(not isinstance(page, list) for page in data):
         fail("Invalid paginated GitHub response")
-    return [entry for page in data for entry in page]
+    entries = [entry for page in data for entry in page]
+    if any(not isinstance(entry, dict) for entry in entries):
+        fail("Invalid GitHub entry")
+    return entries
+
+def identity(release, expected_id, draft):
+    release_id = release.get("id")
+    if type(release_id) is not int or release_id <= 0:
+        fail("Invalid release identifier")
+    if expected_id and release_id != int(expected_id):
+        fail("GitHub returned a different release identifier")
+    if release.get("tag_name") != os.environ["RELEASE_VERSION"]:
+        fail("GitHub returned a different release tag")
+    if release.get("draft") is not draft:
+        fail("An already published release cannot be overwritten" if draft else
+             "GitHub has not confirmed publication")
+    return release_id
 
 if command == "local":
     directory = Path(sys.argv[3]).resolve()
@@ -75,43 +101,74 @@ if command == "local":
         with path.open("rb") as stream:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
         manifest[path.name] = {"size": size, "digest": "sha256:" + digest}
-    (state / "local.json").write_text(json.dumps(manifest), encoding="utf-8")
+    write_text("local.json", json.dumps(manifest))
     (state / "files.nul").write_bytes(
         b"".join(path.as_posix().encode("utf-8") + b"\0" for path in files)
     )
 elif command == "tag":
-    response = json.loads((state / "tag.json").read_text(encoding="utf-8"))
-    obj = response.get("object", {})
+    obj = read_json("tag.json").get("object", {})
     kind, sha = obj.get("type"), obj.get("sha", "")
     if kind not in {"commit", "tag"} or not re.fullmatch(r"[a-fA-F0-9]{40}", sha):
         fail("Remote tag does not resolve to a commit")
     print(kind, sha.lower())
 elif command == "release":
-    matches = [entry for entry in pages("releases.json") if entry.get("tag_name") == sys.argv[3]]
+    matches = [
+        entry for entry in pages("releases.json")
+        if entry.get("tag_name") == os.environ["RELEASE_VERSION"]
+    ]
     if not matches:
         print("missing")
     else:
-        if len(matches) != 1 or matches[0].get("draft") is not True:
-            fail("An already published release cannot be overwritten")
-        release_id = matches[0].get("id")
-        if not isinstance(release_id, int) or release_id <= 0:
-            fail("Invalid release identifier")
-        print(release_id)
-elif command in {"inventory", "verify"}:
-    local = json.loads((state / "local.json").read_text(encoding="utf-8"))
+        if len(matches) != 1:
+            fail("Multiple releases use the requested tag")
+        print(identity(matches[0], "", True))
+elif command == "payload":
+    tag = os.environ["RELEASE_VERSION"]
+    payload = {"tag_name": tag}
+    if sys.argv[3] == "publish":
+        payload["draft"] = False
+    else:
+        payload.update({
+            "name": f"TatoTalk Docker {tag}",
+            "body": Path(sys.argv[4]).read_text(encoding="utf-8"),
+        })
+        if sys.argv[3] == "create":
+            payload.update({"draft": True, "prerelease": False, "target_commitish": sys.argv[5]})
+    write_text("payload.json", json.dumps(payload))
+elif command == "draft":
+    release = read_json("release.json")
+    release_id = identity(release, sys.argv[3], True)
+    # Only send the token to GitHub's upload endpoint for this repository and ID.
+    base = release.get("upload_url", "").split("{", 1)[0]
+    parsed = urlsplit(base)
+    expected_path = f'/repos/{os.environ["GH_REPO"]}/releases/{release_id}/assets'
+    if (parsed.scheme != "https" or parsed.netloc != "uploads.github.com" or
+            parsed.path.lower() != expected_path.lower() or parsed.query or parsed.fragment):
+        fail("Unexpected release upload URL")
+    write_text("upload-base.txt", base)
+    print(release_id)
+elif command in {"inventory", "replace", "verify"}:
+    local = read_json("local.json")
     remote = {}
     for asset in pages("assets.json"):
-        name = asset.get("name")
+        name, asset_id = asset.get("name"), asset.get("id")
         if not managed(name):
             fail("Draft contains an asset not managed by this publishing script")
         if name in remote:
             fail(f"Duplicate remote asset: {name}")
+        if type(asset_id) is not int or asset_id <= 0:
+            fail(f"{name} has an invalid asset identifier")
         remote[name] = asset
     if command == "inventory":
-        (state / "stale.txt").write_text(
-            "".join(name + "\n" for name in sorted(remote.keys() - local.keys())),
-            encoding="utf-8",
-        )
+        write_text("stale.txt", "".join(
+            str(remote[name]["id"]) + "\n" for name in sorted(remote.keys() - local.keys())
+        ))
+    elif command == "replace":
+        name = Path(sys.argv[3]).name
+        if name not in local:
+            fail("Upload path is not a local release artifact")
+        if name in remote:
+            print(remote[name]["id"])
     else:
         if remote.keys() != local.keys():
             fail("Remote asset names do not match the local artifact set")
@@ -124,23 +181,31 @@ elif command in {"inventory", "verify"}:
             if asset.get("digest") != expected["digest"]:
                 fail(f"{name} has a missing or mismatched remote SHA-256 digest")
         print(f"Verified {len(local)} release assets against GitHub SHA-256 digests.")
+elif command == "upload-url":
+    print((state / "upload-base.txt").read_text(encoding="utf-8") +
+          "?" + urlencode({"name": Path(sys.argv[3]).name}))
 elif command == "published":
-    release = json.loads((state / "published.json").read_text(encoding="utf-8"))
+    release = read_json("published.json")
+    identity(release, sys.argv[3], False)
     url = release.get("html_url", "")
-    if release.get("draft") is not False or not url.startswith("https://github.com/"):
-        fail("GitHub has not confirmed publication")
+    if not url.startswith(f'https://github.com/{os.environ["GH_REPO"]}/releases/'):
+        fail("Unexpected published release URL")
     print(url)
 else:
     fail("Unknown validation command")
 PY
 
-python3 "$state_dir/validate.py" "$state_dir" local "$dist"
+validate() {
+  python3 "$state_dir/validate.py" "$state_dir" "$@"
+}
+
+validate local "$dist"
 
 # Resolve annotated tags too, and reject a release tag for a different build.
 gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_VERSION" > "$state_dir/tag.json"
 tag_resolved=false
 for _ in {1..10}; do
-  read -r object_type object_sha < <(python3 "$state_dir/validate.py" "$state_dir" tag)
+  read -r object_type object_sha < <(validate tag)
   if [[ "$object_type" == commit ]]; then
     [[ "$object_sha" == "$source_commit" ]] || fail "Remote tag differs from SOURCE_COMMIT_SHA"
     tag_resolved=true
@@ -150,33 +215,63 @@ for _ in {1..10}; do
 done
 [[ "$tag_resolved" == true ]] || fail "Remote tag chain is too deep"
 
-find_draft() {
-  gh api --paginate --slurp "repos/$GH_REPO/releases?per_page=100" > "$state_dir/releases.json"
-  python3 "$state_dir/validate.py" "$state_dir" release "$RELEASE_VERSION"
-}
-
-release_id="$(find_draft)"
+# A draft can be absent from the list immediately after POST. Capture its ID
+# from the creation response and use that ID for every subsequent operation.
+gh api --paginate --slurp "repos/$GH_REPO/releases?per_page=100" > "$state_dir/releases.json"
+release_id="$(validate release)"
 if [[ "$release_id" == missing ]]; then
-  gh release create "$RELEASE_VERSION" --repo "$GH_REPO" --verify-tag --draft \
-    --target "$source_commit" --title "TatoTalk Docker $RELEASE_VERSION" --notes-file "$notes_file"
-  release_id="$(find_draft)"
-  [[ "$release_id" != missing ]] || fail "Created draft could not be found"
+  validate payload create "$notes_file" "$source_commit"
+  gh api --method POST "repos/$GH_REPO/releases" --input "$state_dir/payload.json" \
+    > "$state_dir/release.json"
+  release_id="$(validate draft "")"
 fi
 
-gh api --paginate --slurp "repos/$GH_REPO/releases/$release_id/assets?per_page=100" \
-  > "$state_dir/assets.json"
-python3 "$state_dir/validate.py" "$state_dir" inventory
-while IFS= read -r stale_asset; do
-  gh release delete-asset "$RELEASE_VERSION" "$stale_asset" --repo "$GH_REPO" --yes
+get_draft() {
+  local read_attempt
+  for read_attempt in 1 2 3; do
+    if gh api "repos/$GH_REPO/releases/$release_id" > "$state_dir/release.json"; then
+      validate draft "$release_id" > /dev/null
+      return
+    fi
+    [[ "$read_attempt" -eq 3 ]] || sleep "$((read_attempt * 5))"
+  done
+  fail "Draft release could not be read by its identifier"
+}
+
+get_assets() {
+  gh api --paginate --slurp "repos/$GH_REPO/releases/$release_id/assets?per_page=100" \
+    > "$state_dir/assets.json"
+}
+
+get_draft
+get_assets
+validate inventory
+while IFS= read -r stale_id; do
+  gh api --method DELETE "repos/$GH_REPO/releases/assets/$stale_id"
 done < "$state_dir/stale.txt"
-gh release edit "$RELEASE_VERSION" --repo "$GH_REPO" \
-  --title "TatoTalk Docker $RELEASE_VERSION" --notes-file "$notes_file"
+
+# Always include tag_name in PATCH; GitHub can otherwise clear a draft's tag.
+get_draft
+validate payload metadata "$notes_file"
+gh api --method PATCH "repos/$GH_REPO/releases/$release_id" --input "$state_dir/payload.json" \
+  > "$state_dir/updated.json"
 
 mapfile -d '' -t assets < "$state_dir/files.nul"
 for asset in "${assets[@]}"; do
   uploaded=false
   for attempt in 1 2 3; do
-    if gh release upload "$RELEASE_VERSION" "$asset" --repo "$GH_REPO" --clobber; then
+    get_draft
+    get_assets
+    # Re-read by ID on each attempt: a failed client may have stored an asset,
+    # including a starter asset, before losing the successful upload response.
+    replace_id="$(validate replace "$asset")"
+    if [[ -n "$replace_id" ]]; then
+      gh api --method DELETE "repos/$GH_REPO/releases/assets/$replace_id"
+    fi
+    upload_url="$(validate upload-url "$asset")"
+    # gh streams --input files and sends their stat size as Content-Length.
+    if gh api --method POST "$upload_url" --header 'Content-Type: application/octet-stream' \
+      --input "$asset" > "$state_dir/upload.json"; then
       uploaded=true
       break
     fi
@@ -188,13 +283,14 @@ for asset in "${assets[@]}"; do
   [[ "$uploaded" == true ]] || fail "Upload failed after three attempts: ${asset##*/}"
 done
 
-gh api --paginate --slurp "repos/$GH_REPO/releases/$release_id/assets?per_page=100" \
-  > "$state_dir/assets.json"
-python3 "$state_dir/validate.py" "$state_dir" verify
-[[ "$(find_draft)" == "$release_id" ]] || fail "Draft release changed during upload"
-gh release edit "$RELEASE_VERSION" --repo "$GH_REPO" --draft=false
+get_assets
+validate verify
+get_draft
+validate payload publish
+gh api --method PATCH "repos/$GH_REPO/releases/$release_id" --input "$state_dir/payload.json" \
+  > "$state_dir/updated.json"
 gh api "repos/$GH_REPO/releases/$release_id" > "$state_dir/published.json"
-release_url="$(python3 "$state_dir/validate.py" "$state_dir" published)"
+release_url="$(validate published "$release_id")"
 printf 'Release published: %s\n' "$release_url"
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
   printf '\nRelease: [%s](%s)\n' "$RELEASE_VERSION" "$release_url" >> "$GITHUB_STEP_SUMMARY"

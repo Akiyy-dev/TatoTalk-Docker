@@ -354,15 +354,16 @@ docker compose up -d --build android
 
 开发机可检查脚本和 Compose 配置，不代表 Docker 容器或 Android 已实际运行。
 测试不需要 Docker 或下载 APK，使用 Python 标准库 unittest，不需要第三方 Python 库。
-其中 4 项启动校验测试还需 POSIX shell；Linux 通常提供 `/bin/sh`，Windows 没有可用的
-`sh` 时这 4 项会自动跳过。可通过 `TATOTALK_TEST_SHELL` 指定已有的 POSIX shell 路径。
+启动校验测试需要 POSIX shell，发布流程测试需要 Bash。Linux 通常提供这两种 shell；
+Windows 可通过 `TATOTALK_TEST_SHELL` 和 `TATOTALK_TEST_BASH` 指定已有的对应程序路径。
+缺少对应 shell 时相关测试会自动跳过；GitHub Actions 的 Ubuntu 环境执行全部测试。
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
 `.github/workflows/ci.yml` 在推送到 `main`、`dev/**` 分支和创建或更新 Pull Request 时
-运行测试与 `linux/amd64` Docker 镜像构建。`.github/workflows/release.yml` 在推送新
+运行脚本测试与 Shell、Compose 配置检查。`.github/workflows/release.yml` 在推送新
 版本 tag（`vX.Y.Z`）时构建镜像、打包部署文件并发布 Release。也可在 GitHub Actions
 中手动运行 **Release** 工作流，在 `tag` 输入项指定一个已有版本 tag，用于重试尚未
 成功发布的版本。已有发布版本禁止覆盖，需要更新内容时应使用新的版本 tag。
