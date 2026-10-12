@@ -7,3 +7,5 @@ Dockerfile text eol=lf
 .gitignore text eol=lf
 .dockerignore text eol=lf
 *.sh text eol=lf
+*.yml text eol=lf
+.gitattributes text eol=lf

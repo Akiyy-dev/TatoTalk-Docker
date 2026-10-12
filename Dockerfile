@@ -6,6 +6,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends aapt python3 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY scripts/probe.py scripts/start.sh /opt/tatotalk/
-RUN chmod 755 /opt/tatotalk/start.sh
+RUN chmod 755 /opt/tatotalk/start.sh \
+    && python3 /opt/tatotalk/probe.py --help > /dev/null \
+    && aapt version \
+    && /bin/sh -n /opt/tatotalk/start.sh
 USER androidusr
 CMD ["/opt/tatotalk/start.sh"]

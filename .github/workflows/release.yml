@@ -1,0 +1,158 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag to build, for example v0.1.0'
+        required: true
+        default: v0.1.0
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      DOCKER_BUILD_RECORD_UPLOAD: 'false'
+    steps:
+      - name: Validate version
+        id: version
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          version="${REQUESTED_TAG:-$GITHUB_REF_NAME}"
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo 'Expected a version tag such as v0.1.0.' >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Checkout version tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ steps.version.outputs.version }}
+          persist-credentials: false
+      - name: Record and verify source commit
+        id: source
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          commit=$(git rev-parse HEAD)
+          tagged_commit=$(git rev-parse "refs/tags/$RELEASE_VERSION^{commit}")
+          [[ "$commit" == "$tagged_commit" ]]
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            event_commit=$(git rev-parse "$GITHUB_SHA^{commit}")
+            [[ "$commit" == "$event_commit" ]]
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+      - name: Test and validate deployment files
+        env:
+          VNC_PASSWORD: testpass
+        run: |
+          python -W error::ResourceWarning -m unittest discover -s tests -v
+          bash -n scripts/start.sh
+          bash -n .github/scripts/publish-release.sh
+          docker compose --env-file .env.example config --quiet
+      - name: Reject replacement of a published Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if gh release view "$RELEASE_VERSION" --json isDraft --jq .isDraft > "$RUNNER_TEMP/existing-release.txt" 2>/dev/null; then
+            if [[ "$(cat "$RUNNER_TEMP/existing-release.txt")" != true ]]; then
+              echo 'This version is already published. Use a new version tag.' >&2
+              exit 1
+            fi
+          fi
+      - name: Free unused SDKs on the hosted build runner
+        run: |
+          if [[ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]]; then
+            echo 'This build is restricted to an ephemeral GitHub-hosted runner.' >&2
+            exit 1
+          fi
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /usr/share/swift
+          df -h /
+          free_kib=$(df -Pk / | awk 'NR==2 {print $4}')
+          if (( free_kib < 30 * 1024 * 1024 )); then
+            echo 'Less than 30 GiB disk headroom remains for the emulator image build/export.' >&2
+            exit 1
+          fi
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build and export the Linux amd64 Docker image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          tags: |
+            tatotalk-android-probe:local
+            tatotalk-android-probe:${{ steps.version.outputs.version }}
+          push: false
+          load: false
+          provenance: false
+          outputs: type=docker,dest=${{ runner.temp }}/tatotalk-image.tar
+      - name: Package the deployment and split image
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          du -h "$RUNNER_TEMP/tatotalk-image.tar"
+          docker buildx prune --all --force
+          mkdir -p dist
+          git archive --format=zip --prefix=TatoTalk-Docker/ HEAD -o dist/TatoTalk-Docker.zip
+          python scripts/package_release.py --image "$RUNNER_TEMP/tatotalk-image.tar" --output-dir dist --version "$RELEASE_VERSION"
+          rm -f "$RUNNER_TEMP/tatotalk-image.tar"
+          (cd dist && sha256sum -c SHA256SUMS.txt)
+          df -h /
+      - name: Prepare release notes
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
+          Linux x86_64 / KVM 的 TatoTalk Android 部署验证镜像。
+
+          下载部署 ZIP、全部镜像分卷、image-manifest.json 和 SHA256SUMS.txt，并放在同一目录。
+          每卷为最多 1900 MiB，须下载全部分卷。逐条执行：
+
+          ```bash
+          sha256sum -c SHA256SUMS.txt
+          cat tatotalk-android-amd64.tar.gz.part-* | docker load
+          unzip TatoTalk-Docker.zip
+          cd TatoTalk-Docker
+          cp .env.example .env
+          ```
+
+          编辑 .env，设置正好 8 位英文字母或数字的 VNC_PASSWORD，然后执行：
+
+          ```bash
+          docker compose up -d --no-build --pull never android
+          docker compose exec android python3 /opt/tatotalk/probe.py check
+          docker compose exec android python3 /opt/tatotalk/probe.py install
+          ```
+
+          浏览器登录方式、SSH 隧道和收消息验收见 README。镜像不包含 TatoTalk APK、账号或登录数据。
+          Actions 完成构建与脚本测试；KVM、ARM 转译、账号登录和新消息接收仍需服务器验收。
+          NOTES
+          printf '\n版本：`%s`\n源码提交：`%s`\n' "$RELEASE_VERSION" "$SOURCE_COMMIT" >> "$RUNNER_TEMP/release-notes.md"
+      - name: Upload verified assets and publish Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: bash .github/scripts/publish-release.sh dist "$RUNNER_TEMP/release-notes.md" '${{ steps.source.outputs.commit }}'
